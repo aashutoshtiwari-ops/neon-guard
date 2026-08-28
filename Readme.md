@@ -22,7 +22,9 @@ Use **one worker** (the default). The loop-block and pool-hold demos are single-
 
 ## UI
 
-Open `/`. Each left-nav card is one issue, with steps on the card. Logs are not fetched on load so a cold-compute run stays cold.
+Open `/`. Cards are in demo order (cold compute first). Logs are not fetched on load so a cold-compute run stays cold.
+
+Full script: [docs/WALKTHROUGH.md](docs/WALKTHROUGH.md) — what each card proves, what to click, what to see.
 
 ## Endpoints
 

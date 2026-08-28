@@ -11,4 +11,4 @@ python3 -m venv .venv
 # shellcheck disable=SC1091
 source .venv/bin/activate
 pip install -r requirements.txt
-exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-43127}"
+exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-43127}" --reload --reload-dir app
