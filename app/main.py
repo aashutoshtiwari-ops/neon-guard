@@ -4,9 +4,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from app.catalog import SCENARIOS
 from app.config import API_KEY, DATABASE_URL, MODEL, STATIC_DIR
-from app.db import list_logs
 from app.gateway import stream_completion
+from app.neon import list_logs, ping, warmup
 
 logging.basicConfig(level=logging.INFO)
 
@@ -29,6 +30,21 @@ def health():
     }
 
 
+@app.get("/demos")
+def demos():
+    return {"scenarios": SCENARIOS}
+
+
+@app.post("/demos/warmup")
+def demos_warmup():
+    return warmup()
+
+
+@app.post("/demos/ping-db")
+def demos_ping_db(mode: str = "fresh"):
+    return ping("pooled" if mode == "pooled" else "fresh")
+
+
 @app.get("/requests")
 def requests_list(limit: int = 50):
     return {"rows": list_logs(limit=min(limit, 200))}
@@ -39,9 +55,17 @@ async def chat_completions(request: Request):
     if not API_KEY:
         return JSONResponse({"error": "AI_GATEWAY_API_KEY is not set"}, status_code=503)
     body = await request.json()
-    block_db = _truthy(request.query_params.get("block_db")) or _truthy(body.get("block_db"))
+    scenario = request.query_params.get("scenario") or body.get("scenario") or "baseline"
+    if _truthy(request.query_params.get("block_db")) or _truthy(body.get("block_db")):
+        scenario = "serial"
+    role = request.query_params.get("role") or body.get("role") or "solo"
     return StreamingResponse(
-        stream_completion(body.get("messages") or [], body.get("model"), block_db=block_db),
+        stream_completion(
+            body.get("messages") or [],
+            body.get("model"),
+            scenario=scenario,
+            role=role,
+        ),
         media_type="text/event-stream",
     )
 
