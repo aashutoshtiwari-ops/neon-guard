@@ -1,0 +1,10 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app ./app
+
+ENV PORT=43127 HOST=0.0.0.0
+EXPOSE 43127
+CMD ["sh", "-c", "uvicorn app.main:app --host ${HOST} --port ${PORT}"]

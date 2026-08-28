@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Chat proxy</title>
+  <style>
+    :root { color-scheme: light; --bg: #f4f1ea; --ink: #1c1916; --muted: #5c564e; --card: #fffcf7; --line: #ddd4c6; --accent: #1f4d3a; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
+    main { max-width: 880px; margin: 0 auto; padding: 24px 16px 48px; }
+    h1 { font-size: 1.4rem; margin: 0 0 16px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+    .pill { background: var(--card); border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; font-size: 0.85rem; }
+    .chat { background: var(--card); border: 1px solid var(--line); border-radius: 12px; min-height: 220px; padding: 16px; white-space: pre-wrap; line-height: 1.5; }
+    .meta { font-size: 0.85rem; color: var(--muted); margin: 10px 0 16px; }
+    textarea { width: 100%; min-height: 88px; border: 1px solid var(--line); border-radius: 10px; padding: 12px; font: inherit; background: var(--card); }
+    .actions { display: flex; gap: 10px; align-items: center; margin: 12px 0 28px; flex-wrap: wrap; }
+    button { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 10px 16px; font: inherit; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    label { font-size: 0.9rem; display: flex; gap: 8px; align-items: center; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }
+    .err { color: #8b1e1e; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Chat proxy</h1>
+    <div class="row" id="status"></div>
+    <div class="chat" id="out">Send a prompt to stream a reply.</div>
+    <div class="meta" id="timing"></div>
+    <textarea id="prompt">What is time to first token, in one sentence?</textarea>
+    <div class="actions">
+      <button id="send">Send</button>
+      <label><input type="checkbox" id="blockDb" /> Block on DB before stream (worse TTFT)</label>
+    </div>
+    <h2>Recent requests</h2>
+    <div id="logs"></div>
+  </main>
+  <script>
+    const out = document.getElementById("out");
+    const timing = document.getElementById("timing");
+    const promptEl = document.getElementById("prompt");
+    const send = document.getElementById("send");
+    const blockDb = document.getElementById("blockDb");
+
+    async function loadHealth() {
+      const h = await fetch("/health").then(r => r.json());
+      document.getElementById("status").innerHTML = `
+        <span class="pill">DB: ${h.database || "off"}</span>
+        <span class="pill">Key: ${h.gateway_key ? "set" : "missing"}</span>
+        <span class="pill">Model: ${h.model}</span>
+      `;
+    }
+
+    async function loadLogs() {
+      const data = await fetch("/requests?limit=20").then(r => r.json());
+      if (!data.rows.length) {
+        document.getElementById("logs").textContent = "No rows yet.";
+        return;
+      }
+      const rows = data.rows.map(r => `<tr>
+        <td>${(r.created_at || "").slice(11, 19)}</td>
+        <td>${r.status || ""}</td>
+        <td>${r.ttft_ms ?? "—"}</td>
+        <td>${r.total_ms ?? "—"}</td>
+        <td>${r.prompt_chars ?? ""}</td>
+        <td class="err">${r.error || ""}</td>
+      </tr>`).join("");
+      document.getElementById("logs").innerHTML = `
+        <table>
+          <thead><tr><th>Time</th><th>Status</th><th>TTFT ms</th><th>Total ms</th><th>Prompt chars</th><th>Error</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+    }
+
+    function parseSseBlock(block) {
+      let event = "message";
+      let data = "";
+      for (const line of block.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        if (line.startsWith("data:")) data += line.slice(5).trim();
+      }
+      return { event, data };
+    }
+
+    send.addEventListener("click", async () => {
+      send.disabled = true;
+      out.textContent = "";
+      timing.textContent = "Streaming…";
+      const url = "/chat/completions" + (blockDb.checked ? "?block_db=1" : "");
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: [{ role: "user", content: promptEl.value }] }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        out.textContent = err.error || res.statusText;
+        send.disabled = false;
+        return;
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let text = "";
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const parts = buf.split("\n\n");
+          buf = parts.pop();
+          for (const part of parts) {
+            const { event, data } = parseSseBlock(part);
+            if (!data) continue;
+            if (event === "meta") {
+              const meta = JSON.parse(data);
+              timing.textContent = `TTFT ${meta.ttft_ms} ms${meta.block_db ? " · DB blocked before stream" : ""}`;
+              continue;
+            }
+            if (data === "[DONE]") continue;
+            try {
+              const json = JSON.parse(data);
+              if (json.error) { out.textContent += "\n" + json.error; continue; }
+              const delta = json.choices?.[0]?.delta?.content;
+              if (delta) { text += delta; out.textContent = text; }
+            } catch (_) {}
+          }
+        }
+      } finally {
+        send.disabled = false;
+        await loadLogs();
+      }
+    });
+
+    loadHealth();
+    loadLogs();
+  </script>
+</body>
+</html>
