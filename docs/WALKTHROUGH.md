@@ -1,139 +1,223 @@
-# TTFT demo walkthrough
+# Allow-list vs TTFT — live demo script
 
-Live script for the Neon allow-list cards. Run the cards **top to bottom**. Card 1 only works if nothing has talked to Neon yet in this session.
+This is the talk track. The app is small on purpose: **the same Postgres allow-list `SELECT`**, written four different ways, and what that does to **time to first token (TTFT)**.
 
-## What you are proving
-
-An allow-list (or any Postgres check) does not have to sit in front of the first model token. When it does — or when it shares the event loop, the connection pool, or a longer network path — **time to first token (TTFT)** goes up. Each card isolates one mechanism so you are not mixing “we queried before the model” with “we froze the loop” with “compute was asleep.”
-
-**TTFT** here is wall time until the first SSE `meta` event (server) and until the browser sees that event (**client TTFT**). Prefer client TTFT when two requests overlap.
-
-## Before you start
-
-1. `uvicorn app.main:app --host 0.0.0.0 --port 43127` with **one worker** (default). Loop-block and pool-hold are single-process.
-2. Open `/`. Confirm the pills: DB `neon`, gateway key set.
-3. Leave **Refresh logs** alone until after card 1. Logs query Neon and will wake compute.
-4. Do not click **Warm up DB** or **DB ping** until the walkthrough says so.
-5. Neon console: compute can go Idle (Scale still autosuspends unless you pin it). Short suspend makes card 1 practical.
-
-If you already warmed the database, skip to card 2 and come back to card 1 after compute shows Idle again.
+Run the four cards **top to bottom**. Write down numbers as you go; later cards only make sense against card 1.
 
 ---
 
-### 1. Cold compute
+## What this demo is (and is not)
 
-**Trying to do:** Show that the first allow-list hit after suspend includes **compute wake**, not just SQL. That delay is on the path to the first token.
+**Is:** How *application code* that gates a chat request on an allow-list can delay the first model token — or delay *someone else’s* first token.
 
-**Why first:** Warm up, pings, other Runs, and log refresh all start compute. You get one cold sample per idle period.
+**Is not:** Neon Scale IP Allow List as extra latency. If this GCP VM’s public IP is on Neon’s list, connections from the VM are simply **allowed**. That is a pass/fail door, not a hop. You need it so `DATABASE_URL` works. You are not measuring it.
 
-**Do:** Confirm Idle in Neon. Stay on this card. Click **Run** (or **DB ping (fresh)** to skip the model). Then **Run** again immediately.
+**Is not:** Cold compute, connection-pooler vs direct URL, NAT in front of serverless, or “the SQL is slow.” Each card uses the same tiny `SELECT id FROM allowlist WHERE id = 'demo'`.
 
-**See:**
-
-| | connect ms | query ms | TTFT |
-|---|---|---|---|
-| First hit | large (hundreds of ms to seconds) | small | inflated by connect |
-| Second hit | much smaller | still small | closer to a warm connect |
-
-If both hits look warm, compute was never Idle (page load does not hit Neon; something else did).
+The story: *“We added an allow-list in Neon. If we put that check on the path to the first token — or we call it with a blocking driver on the event loop — TTFT gets worse. Here are the exact code shapes.”*
 
 ---
 
-### 2. New TLS connection
+## Before the room sits down
 
-**Trying to do:** With compute **warm**, show that `psycopg.connect()` per check is the cost. The allow-list `SELECT` is not.
+1. App is running with **one uvicorn worker** (default). Pair demo (card 4) is wrong with multiple workers.
+2. Open the UI (`/`). Pills should show **DB: neon** and **Key: set**.
+3. Leave the prompt as the default one-sentence question unless you need a shorter stream.
+4. Have a notepad or the “Recent requests” table for TTFT numbers. After each successful run, **Refresh logs** if you want a paper trail; it is optional and talks to Neon (fine after you no longer care about a cold start).
 
-**Do:** **DB ping (fresh)** then **DB ping (pooled)**. Then **Run** (fresh TLS before the stream).
-
-**See:** Fresh ping: **connect ms ≫ query ms**. Pooled ping: **connect ms = 0**. The Run’s TTFT includes fresh **connect ms**. Same query as later cards; different checkout.
-
----
-
-### 3. Stream first (control)
-
-**Trying to do:** Give every later card a comparison number. Tokens start without waiting on Neon. Allow-list/logging run off the loop.
-
-**Do:** **Warm up DB**. **Run** twice. Keep the second TTFT / client TTFT.
-
-**See:** **connect ms**, **query ms**, **pool wait ms** on the critical path are **0**. TTFT tracks the model. This is the “done correctly” path.
+If DB is `off`, allow-list calls no-op (`allowlist_ms` stays 0) and cards 2–4 will not move. Fix `DATABASE_URL` first.
 
 ---
 
-### 4. Allow-list, then stream
-
-**Trying to do:** Classic ordering bug — wait for a **warm pooled** lookup, *then* open the model. Isolates order; not TLS, not cold start.
-
-**Do:** Warm if needed. **Run**. Compare to card 3.
-
-**See:** TTFT ≈ baseline + **query ms**. **connect ms = 0**, **round trips = 1**. Same as the old `?block_db=1` flag.
-
----
-
-### 5. Parallel, then yield
-
-**Trying to do:** `gather(allow-list, open model)` still withholds the first token until **both** finish. Parallelism ≠ overlapping TTFT.
-
-**Do:** Warm. **Run**. Compare to cards 3 and 4.
-
-**See:** TTFT is **max(db, model connect)**, not model-only. Slow Neon ≈ card 4. Fast Neon may look near card 3 — that is why card 6 exists.
-
----
-
-### 6. Four round trips
-
-**Trying to do:** User → org → role → flag as four sequential SELECTs on a warm connection. Chatty checks add RTT, not CPU.
-
-**Do:** Warm. **Run**. Compare **query ms** and **round trips** to card 4.
-
-**See:** **round trips = 4**. **query ms** roughly 4× serial. TTFT up by that extra query time. One indexed lookup (or a cache) would flatten this.
-
----
-
-### 7. Sync DB freezes the loop
-
-**Trying to do:** Show a **sibling** request’s TTFT, not “this request logged first.” Sync Postgres on asyncio blocks **everyone** on that worker. Logging after a stream can still stall the next chat.
-
-**Why a pair:** One request cannot be both the stall and the victim. **Run pair** starts the victim (stream first), then the blocker (sync connect + `pg_sleep(1)`, no model).
-
-**See:** Blocker **TTFT** is tiny. Victim **client TTFT** is about **1s+** above card 3, and that request never ran the allow-list itself. This is not the same bug as card 4.
-
----
-
-### 8. Hold the pool slot
-
-**Trying to do:** Pool size 1. Checkout, then **keep the slot while the model streams**. The other chat waits **before** it may open the model. Distinct from card 7: the loop still runs; only the slot is busy.
-
-**Do:** **Run pair** (both start at once). Streams are capped (`max_tokens` 48).
-
-**See:** One request: **pool wait ms ≈ 0**, TTFT near baseline. The other: **pool wait ms** on the order of the first stream’s duration, TTFT inflated by that wait.
-
----
-
-### 9. IP allow list / NAT hop
-
-**Trying to do:** Explain the Scale IP allow-list path. Serverless egress IPs rotate, so people front Neon with a **static NAT or proxy**. That extra hop is on every new connection. A wrong listed IP fails until **connect_timeout** (10s here).
-
-**Do:** No **Run**. Compare direct Neon vs the same query through NAT/proxy, or mislist an IP.
-
-**See:** Success: small constant on **connect ms**. Failure: multi-second TTFT or errors — not a slow `SELECT`.
-
----
-
-## Metrics on the card
+## How to read the metrics
 
 | Field | Meaning |
-|---|---|
-| TTFT ms | Server clock: start of handler → first SSE meta |
-| client TTFT ms | Browser clock: `fetch` → first meta (use this for pairs) |
-| connect ms | New TLS/auth to Neon (0 if pooled socket already open) |
-| query ms | Time in `SELECT`s after the socket is up |
-| pool wait ms | Time waiting for the one-slot hold demo |
-| round trips | How many allow-list `SELECT`s ran |
+| --- | --- |
+| **TTFT ms** | Server clock: request handler starts → first SSE `meta` event. For a single chat, this is the number to quote. |
+| **client TTFT ms** | Browser clock: `fetch` starts → first `meta`. Use this on **card 4**. The victim’s wait includes time the server loop was frozen *before* the victim handler could finish producing the first token, and also queueing in the browser/network. |
+| **allowlist_ms** | Time spent in the allow-list function *on this request’s critical path*. Card 1 reports **0** here even though a background check still runs — that is the point. Cards 2–3 report the pooled `SELECT`. Card 4’s blocker reports the sync call (including `pg_sleep(1)`). |
 
-## If numbers look wrong
+Model TTFT itself jitters (load, region, gateway). Always compare **the same session**, card 1 vs 2 vs 3, not a number from yesterday.
 
-- **Cold never looks cold** — something already hit Neon; idle compute and retry card 1 only.
-- **Serial ≈ connect card** — pool was not warm; Warm up, then serial again.
-- **Loop victim not slower** — more than one uvicorn worker, or the stall missed the overlap; one worker and Run pair only.
-- **Hold both wait ≈ 0** — they did not overlap; use Run pair, not two manual Sends.
-- **No DB metrics** — `DATABASE_URL` missing; pills will not say `neon`.
+---
+
+## Card 1 — Don’t wait (control)
+
+### What you are proving
+
+The allow-list does **not** have to sit in front of the first token. Start the model stream immediately; run `SELECT` in the background (`asyncio.create_task` + `to_thread`). Logging after the stream also uses `to_thread`, so it does not freeze the loop.
+
+This is the **only** number the rest of the demo is allowed to beat.
+
+### What the code does
+
+```text
+create_task(allowlist())          # do not await
+async for token in model.stream():
+    yield token                   # first yield is TTFT
+```
+
+### Steps
+
+1. Click **1. Don’t wait**.
+2. Click **Run**. Wait until tokens appear and the metrics row fills in.
+3. Write down **TTFT ms** and **client TTFT ms**. Ignore this first run if it looks like an outlier (cold model / first HTTP to the gateway).
+4. Click **Run** again.
+5. Write down the **second** TTFT. That is **Baseline B**. Say it out loud: “This is model time only.”
+
+### What you should see
+
+- **allowlist_ms = 0** on the metric strip (not on the critical path).
+- Tokens start as fast as the model/gateway allow.
+- A reply still streams; the check happened, it just did not block TTFT.
+- Status in logs: `good` (or `ok` with scenario `good`).
+
+### If it looks wrong
+
+- No stream / gateway error: API key or model, not Neon.
+- `allowlist_ms` not 0: you are on the wrong card.
+
+**Talking point:** *“The product still enforced allow-list. We did not make TTFT wait for Postgres.”*
+
+---
+
+## Card 2 — Await, then stream
+
+### What you are proving
+
+The classic bug: **same query**, wrong place on the timeline. The handler `await`s the allow-list, *then* opens the model. Every millisecond of that `SELECT` (and pool checkout) is added to TTFT.
+
+This is not “Neon is slow SQL.” It is **order**.
+
+### What the code does
+
+```text
+allowlist_ms = await allowlist()  # must finish
+async for token in model.stream():
+    yield token
+```
+
+The allow-list still runs in a worker thread (`to_thread`), so this card does **not** freeze other requests. It only delays **this** chat’s first token.
+
+### Steps
+
+1. Click **2. Await, then stream**.
+2. Click **Run** once (twice if the first run looks noisy).
+3. Put **TTFT ms** next to Baseline B.
+4. Look at **allowlist_ms** on the same row.
+
+### What you should see
+
+- **TTFT ≈ Baseline B + allowlist_ms** (plus a little jitter).
+- **allowlist_ms** is typically tens of milliseconds on a warm pool from this VM, sometimes more. Even a small add is the mechanism; you do not need a huge number.
+- Logs scenario: `serial`.
+
+### What to say
+
+*“We didn’t change the query. We waited for it before we were allowed to start the model. TTFT is now model plus allow-list.”*
+
+### If it looks wrong
+
+- TTFT ≈ card 1 and **allowlist_ms = 0**: `DATABASE_URL` missing.
+- TTFT much larger than allowlist_ms extra: model jitter. Run card 1 again, then card 2 again, same minute.
+
+---
+
+## Card 3 — Gather, then yield
+
+### What you are proving
+
+A common “fix” that is not a fix: start allow-list and the model HTTP connect **at the same time**, but **do not yield any token until both have finished**.
+
+```text
+allowlist, stream = await gather(allowlist(), open_model())
+async for token in stream:
+    yield token   # first yield is after gather returns
+```
+
+Parallel work. **TTFT still waits for the slower of the two.** If the allow-list is slower than “open the stream,” this looks as bad as card 2. If the allow-list is faster, it may look close to card 1 — which is why you already showed card 2, and why you say the sentence below.
+
+True overlap (card 1) is: **yield as soon as the model has a token**, even if allow-list is still running (and abort later if denied).
+
+### Steps
+
+1. Click **3. Gather, then yield**.
+2. Click **Run**.
+3. Compare **TTFT** to Baseline B and to card 2.
+4. Note **allowlist_ms** (time for the check that ran inside `gather`).
+
+### What you should see
+
+- TTFT is **at least** as large as the slower of {allow-list, time to first model byte after connect}.
+- It should **not** be better than card 1 in a systematic way.
+- If Neon is fast from this VM, gather may look **near** card 1. That is honest: the bug is the **join before first yield**, not “gather always adds 200ms.” Say: *“We still coupled first token to both finishing. We got lucky if Postgres was faster than the model.”*
+- Logs scenario: `gather`.
+
+### What to say
+
+*“asyncio.gather does not mean the user sees a token sooner. It means we wait for max(db, model-connect) before we are allowed to stream.”*
+
+---
+
+## Card 4 — Sync allow-list (pair)
+
+### What you are proving
+
+This is **not** “await allow-list then stream” (that was card 2). This is: a **blocking** allow-list (`psycopg.connect` + `SELECT` on the asyncio thread) so **another** request cannot run.
+
+Card 2 delays **this** user. Card 4 delays **the other** user, even when that other user wrote card-1-correct code.
+
+`pg_sleep(1)` is only so the stall is obvious in a noisy room. The bug is **sync I/O on the loop**; a slow TLS handshake would do the same.
+
+### Why one click cannot be a single request
+
+One HTTP handler cannot be both the stall and the victim. **Run pair**:
+
+1. **Victim** starts first: same path as card 1 (stream, don’t wait on allow-list).
+2. After ~80ms, **blocker** sends a `meta` immediately, then runs the **sync** allow-list on the loop (no model).
+
+While the blocker is inside `connect` / `SELECT` / `pg_sleep(1)`, the loop cannot resume the victim’s `await` on the model stream, so the victim’s first token is late.
+
+### Steps
+
+1. You already have Baseline B from card 1. If it has been a while, run card 1 once more and update B.
+2. Click **4. Sync allow-list (pair)**.
+3. Click **Run pair** once. Do not click Run twice overlapping; let the pair finish.
+4. Read **two** metric blocks: Victim, then Blocker.
+
+### What you should see
+
+| | TTFT ms | client TTFT ms | allowlist_ms |
+| --- | --- | --- | --- |
+| **Blocker** | tiny (it yields `meta` before the stall) | small | ~1000+ (sleep + connect) |
+| **Victim** | ~1s above Baseline B if the stall overlapped waiting for the first token | **this is the slide number** | 0 on the critical path |
+
+- Victim still never `await`ed the allow-list. Their inflation is **someone else’s sync call**.
+- Logs: `sync:victim` and `sync:blocker` (blocker status `sync_stall`).
+
+### What to say
+
+*“Logging or allow-list with a sync driver after you think you’re done still shares the event loop. The next chat’s TTFT includes your `connect()`.”*
+
+### If it looks wrong
+
+- Victim **not** ~1s slower: **more than one uvicorn worker**, or the pair did not overlap (clicked wrong). Confirm one worker; use only **Run pair**.
+- Both fail: Neon/IP allow list or network; blocker needs a real connect unless `DATABASE_URL` is unset (then it still `sleep(1)`).
+- You compared server TTFT only and it looks mild: quote **victim client TTFT** vs card 1 **client TTFT**.
+
+---
+
+## Suggested 5-minute spine
+
+1. Card 1 twice → “Baseline B, allow-list off the path.”
+2. Card 2 → “Same SELECT, we waited. TTFT += allowlist_ms.”
+3. Card 3 → “Gather still joins before the first token.”
+4. Card 4 → “Sync check on the loop taxes the *other* request. One worker, Run pair, look at victim client TTFT.”
+
+Close: *“Correct shape is card 1: start the stream; don’t await the allow-list before the first token; don’t put blocking Postgres on the event loop.”*
+
+---
+
+## After the demo (optional)
+
+Refresh logs and walk the scenario column: `good`, `serial`, `gather`, `sync:victim`, `sync:blocker`. Same table, four code paths.

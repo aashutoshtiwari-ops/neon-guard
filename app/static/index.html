@@ -3,71 +3,56 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Neon TTFT demos</title>
+  <title>Allow-list TTFT</title>
   <style>
     :root { color-scheme: light; --bg: #f4f1ea; --ink: #1c1916; --muted: #5c564e; --card: #fffcf7; --line: #ddd4c6; --accent: #1f4d3a; --warn: #8b1e1e; }
     * { box-sizing: border-box; }
     body { margin: 0; font-family: "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
-    main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
-    h1 { font-size: 1.35rem; margin: 0 0 8px; }
+    main { max-width: 960px; margin: 0 auto; padding: 24px 16px 48px; }
+    h1 { font-size: 1.3rem; margin: 0 0 8px; }
     .lede { color: var(--muted); margin: 0 0 16px; font-size: 0.95rem; }
-    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+    .pills { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
     .pill { background: var(--card); border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; font-size: 0.85rem; }
-    .layout { display: grid; grid-template-columns: 220px 1fr; gap: 16px; }
-    @media (max-width: 800px) { .layout { grid-template-columns: 1fr; } }
+    .layout { display: grid; grid-template-columns: 200px 1fr; gap: 16px; }
+    @media (max-width: 760px) { .layout { grid-template-columns: 1fr; } }
     .nav { display: flex; flex-direction: column; gap: 6px; }
-    .nav button { background: var(--card); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; text-align: left; font: inherit; cursor: pointer; }
+    .nav button, .ghost { background: var(--card); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font: inherit; cursor: pointer; text-align: left; }
     .nav button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
     .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
-    .card h2 { margin: 0 0 8px; font-size: 1.1rem; }
-    .card ol { margin: 8px 0 16px; padding-left: 1.2rem; }
-    .card li { margin: 6px 0; }
-    .look { background: #efe8da; border-radius: 8px; padding: 10px 12px; font-size: 0.9rem; margin-bottom: 14px; }
-    .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
-    button.go { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 10px 16px; font: inherit; cursor: pointer; }
-    button.go:disabled { opacity: 0.5; cursor: not-allowed; }
-    button.ghost { background: var(--card); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 10px 16px; font: inherit; cursor: pointer; }
-    textarea { width: 100%; min-height: 64px; border: 1px solid var(--line); border-radius: 10px; padding: 10px; font: inherit; background: #fff; margin: 8px 0; }
-    .metrics { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; margin: 12px 0; }
+    .card h2 { margin: 0 0 8px; font-size: 1.05rem; }
+    .card ol { margin: 8px 0 12px; padding-left: 1.2rem; }
+    .look { background: #efe8da; border-radius: 8px; padding: 10px 12px; font-size: 0.9rem; margin-bottom: 12px; }
+    .go { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 10px 16px; font: inherit; cursor: pointer; }
+    .go:disabled { opacity: 0.5; }
+    textarea { width: 100%; min-height: 56px; border: 1px solid var(--line); border-radius: 10px; padding: 10px; font: inherit; margin: 8px 0; }
+    .metrics { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; margin: 12px 0; }
     .metric { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
-    .metric b { display: block; font-size: 1.15rem; }
+    .metric b { display: block; font-size: 1.1rem; }
     .metric span { font-size: 0.75rem; color: var(--muted); }
-    .chat { min-height: 80px; white-space: pre-wrap; line-height: 1.45; font-size: 0.9rem; border-top: 1px solid var(--line); padding-top: 12px; }
+    .chat { white-space: pre-wrap; font-size: 0.9rem; border-top: 1px solid var(--line); padding-top: 12px; min-height: 48px; }
     .err { color: var(--warn); }
-    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-top: 16px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-top: 12px; }
     th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }
   </style>
 </head>
 <body>
   <main>
-    <h1>Neon allow-list TTFT demos</h1>
-    <p class="lede">Cards run top to bottom. Start with cold compute — Warm up, ping, other Runs, and Refresh logs all wake Neon and spend that shot. Pair cards need two overlapping requests. Use one uvicorn worker.</p>
-    <div class="row" id="status"></div>
+    <h1>Allow-list vs TTFT</h1>
+    <p class="lede">Four ways to write the same Postgres allow-list check. Only the code path to the first token changes. One uvicorn worker.</p>
+    <div class="pills" id="status"></div>
     <div class="layout">
       <nav class="nav" id="nav"></nav>
       <section class="card" id="panel"></section>
     </div>
     <h2>Recent requests</h2>
     <button class="ghost" id="refreshLogs" type="button">Refresh logs</button>
-    <div id="logs">Logs are not loaded on page open so a cold-compute demo stays cold.</div>
+    <div id="logs"></div>
   </main>
   <script>
     const promptDefault = "What is time to first token, in one sentence?";
-    let scenarios = [];
-    let current = null;
 
-    async function loadHealth() {
-      const h = await fetch("/health").then(r => r.json());
-      document.getElementById("status").innerHTML = `
-        <span class="pill">DB: ${h.database || "off"}</span>
-        <span class="pill">Key: ${h.gateway_key ? "set" : "missing"}</span>
-        <span class="pill">Model: ${h.model}</span>
-      `;
-    }
-
-    function parseSseBlock(block) {
-      let event = "message";
-      let data = "";
+    function parseSse(block) {
+      let event = "message", data = "";
       for (const line of block.split("\n")) {
         if (line.startsWith("event:")) event = line.slice(6).trim();
         if (line.startsWith("data:")) data += line.slice(5).trim();
@@ -75,54 +60,42 @@
       return { event, data };
     }
 
-    function metric(label, value) {
-      const shown = value === undefined || value === null || Number.isNaN(value) ? "—" : value;
-      return `<div class="metric"><b>${shown}</b><span>${label}</span></div>`;
+    function metrics(label, meta, text) {
+      const cell = (k, v) => `<div class="metric"><b>${v ?? "—"}</b><span>${k}</span></div>`;
+      return `<div class="metrics">
+        ${cell("role", label)}
+        ${cell("TTFT ms", meta.ttft_ms)}
+        ${cell("client TTFT ms", meta.client_ttft_ms)}
+        ${cell("allowlist ms", meta.allowlist_ms)}
+      </div><div class="chat">${text || ""}</div>`;
     }
 
-    function renderMetrics(label, meta, text) {
-      return `
-        <div class="metrics">
-          ${metric("role", label)}
-          ${metric("TTFT ms", meta.ttft_ms)}
-          ${metric("client TTFT ms", meta.client_ttft_ms)}
-          ${metric("connect ms", meta.connect_ms)}
-          ${metric("query ms", meta.query_ms)}
-          ${metric("pool wait ms", meta.pool_wait_ms)}
-          ${metric("round trips", meta.round_trips)}
-        </div>
-        <div class="chat">${text || ""}</div>
-      `;
-    }
-
-    async function consumeStream(res, onMeta, t0) {
+    async function consume(res, t0, onMeta) {
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.error || res.statusText);
       }
       const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      let text = "";
-      let meta = {};
+      const dec = new TextDecoder();
+      let buf = "", text = "", meta = {};
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        buf += decoder.decode(value, { stream: true });
+        buf += dec.decode(value, { stream: true });
         const parts = buf.split("\n\n");
         buf = parts.pop();
         for (const part of parts) {
-          const parsed = parseSseBlock(part);
-          if (!parsed.data) continue;
-          if (parsed.event === "meta") {
-            meta = JSON.parse(parsed.data);
+          const { event, data } = parseSse(part);
+          if (!data) continue;
+          if (event === "meta") {
+            meta = JSON.parse(data);
             if (t0 != null) meta.client_ttft_ms = Math.round(performance.now() - t0);
             if (onMeta) onMeta(meta);
             continue;
           }
-          if (parsed.data === "[DONE]") continue;
+          if (data === "[DONE]") continue;
           try {
-            const json = JSON.parse(parsed.data);
+            const json = JSON.parse(data);
             if (json.error) { text += "\n" + json.error; continue; }
             const delta = json.choices?.[0]?.delta?.content;
             if (delta) text += delta;
@@ -132,7 +105,7 @@
       return { meta, text };
     }
 
-    async function openChat(scenario, role, prompt) {
+    function openChat(scenario, role, prompt) {
       return fetch(`/chat/completions?scenario=${encodeURIComponent(scenario)}&role=${encodeURIComponent(role)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -140,94 +113,51 @@
       });
     }
 
-    async function openAndWaitMeta(scenario, role, prompt, t0) {
-      const res = await openChat(scenario, role, prompt);
-      let release;
-      const gotMeta = new Promise((resolve) => { release = resolve; });
-      const rest = consumeStream(res, (meta) => release(meta), t0);
-      const meta = await gotMeta;
-      return { meta, rest };
-    }
-
-    function panelEl() { return document.getElementById("panel"); }
-
     function render(s) {
-      current = s;
       document.querySelectorAll(".nav button").forEach((b) => b.classList.toggle("on", b.dataset.id === s.id));
-      const runnable = s.kind !== "explain";
-      const pair = s.kind.startsWith("pair");
-      panelEl().innerHTML = `
+      const pair = s.kind === "pair";
+      document.getElementById("panel").innerHTML = `
         <h2>${s.title}</h2>
         <p>${s.summary}</p>
         <ol>${s.steps.map((x) => `<li>${x}</li>`).join("")}</ol>
         <div class="look"><strong>Look for:</strong> ${s.look_for}</div>
-        ${runnable ? `<textarea id="prompt">${promptDefault}</textarea>
-          <div class="actions">
-            <button class="go" id="run">${pair ? "Run pair" : "Run"}</button>
-            <button class="ghost" id="warmup" type="button">Warm up DB</button>
-            <button class="ghost" id="pingFresh" type="button">DB ping (fresh)</button>
-            <button class="ghost" id="pingPooled" type="button">DB ping (pooled)</button>
-          </div>` : `<p class="lede">No in-app run — follow the steps above on the network path.</p>`}
-        <div id="pingOut" class="lede"></div>
-        <div id="out"></div>
-      `;
-      if (!runnable) return;
-      document.getElementById("run").onclick = () => runScenario(s);
-      document.getElementById("warmup").onclick = async () => {
-        const data = await fetch("/demos/warmup", { method: "POST" }).then((r) => r.json());
-        document.getElementById("pingOut").textContent = data.ok ? `Pool warm in ${data.ms} ms` : (data.error || "warmup failed");
-      };
-      document.getElementById("pingFresh").onclick = () => pingDb("fresh");
-      document.getElementById("pingPooled").onclick = () => pingDb("pooled");
+        <textarea id="prompt">${promptDefault}</textarea>
+        <button class="go" id="run">${pair ? "Run pair" : "Run"}</button>
+        <div id="out"></div>`;
+      document.getElementById("run").onclick = () => run(s);
     }
 
-    async function pingDb(mode) {
-      const data = await fetch(`/demos/ping-db?mode=${mode}`, { method: "POST" }).then((r) => r.json());
-      if (!data.ok) {
-        document.getElementById("pingOut").textContent = data.error || "ping failed";
-        return;
-      }
-      document.getElementById("pingOut").textContent =
-        `${data.mode}: connect ${data.connect_ms} ms · query ${data.query_ms} ms · trips ${data.round_trips}`;
-    }
-
-    async function runScenario(s) {
-      const run = document.getElementById("run");
+    async function run(s) {
+      const btn = document.getElementById("run");
       const out = document.getElementById("out");
       const prompt = document.getElementById("prompt").value;
-      run.disabled = true;
+      btn.disabled = true;
       out.textContent = "Running…";
       try {
         if (s.kind === "single") {
           const t0 = performance.now();
-          const res = await openChat(s.id, "solo", prompt);
-          const { meta, text } = await consumeStream(res, null, t0);
-          out.innerHTML = renderMetrics("solo", meta, text);
-        } else if (s.kind === "pair_sequence") {
-          const tVictim = performance.now();
-          const victimRes = await openChat(s.id, "victim", prompt);
-          const victimP = consumeStream(victimRes, null, tVictim);
+          const { meta, text } = await consume(await openChat(s.id, "solo", prompt), t0);
+          out.innerHTML = metrics("solo", meta, text);
+        } else {
+          const tV = performance.now();
+          const victimP = consume(await openChat(s.id, "victim", prompt), tV);
           await new Promise((r) => setTimeout(r, 80));
-          const tBlocker = performance.now();
-          const blocker = await openAndWaitMeta(s.id, "blocker", prompt, tBlocker);
-          const [victim, blockerDone] = await Promise.all([victimP, blocker.rest]);
-          out.innerHTML =
-            "<h3>Victim (innocent stream)</h3>" + renderMetrics("victim", victim.meta, victim.text) +
-            "<h3>Blocker (sync Neon on the loop)</h3>" + renderMetrics("blocker", blockerDone.meta, blockerDone.text || "(no model call)");
-        } else if (s.kind === "pair_parallel") {
-          const tA = performance.now();
           const tB = performance.now();
-          const [aRes, bRes] = await Promise.all([openChat(s.id, "a", prompt), openChat(s.id, "b", prompt)]);
-          const [a, b] = await Promise.all([consumeStream(aRes, null, tA), consumeStream(bRes, null, tB)]);
+          const resB = await openChat(s.id, "blocker", prompt);
+          let unlock;
+          const got = new Promise((r) => { unlock = r; });
+          const rest = consume(resB, tB, unlock);
+          await got;
+          const [victim, blocker] = await Promise.all([victimP, rest]);
           out.innerHTML =
-            "<h3>Request A</h3>" + renderMetrics("a", a.meta, a.text) +
-            "<h3>Request B</h3>" + renderMetrics("b", b.meta, b.text);
+            "<h3>Victim</h3>" + metrics("victim", victim.meta, victim.text) +
+            "<h3>Blocker</h3>" + metrics("blocker", blocker.meta, blocker.text || "(sync allow-list, no model)");
         }
         await loadLogs();
-      } catch (err) {
-        out.innerHTML = `<p class="err">${err.message || err}</p>`;
+      } catch (e) {
+        out.innerHTML = `<p class="err">${e.message || e}</p>`;
       } finally {
-        run.disabled = false;
+        btn.disabled = false;
       }
     }
 
@@ -237,31 +167,29 @@
         document.getElementById("logs").textContent = "No rows yet.";
         return;
       }
-      const rows = data.rows.map((r) => `<tr>
-        <td>${(r.created_at || "").slice(11, 19)}</td>
-        <td>${r.scenario || ""}</td>
-        <td>${r.status || ""}</td>
-        <td>${r.ttft_ms ?? "—"}</td>
-        <td>${r.total_ms ?? "—"}</td>
-        <td class="err">${r.error || ""}</td>
-      </tr>`).join("");
-      document.getElementById("logs").innerHTML = `
-        <table>
-          <thead><tr><th>Time</th><th>Scenario</th><th>Status</th><th>TTFT ms</th><th>Total ms</th><th>Error</th></tr></thead>
-          <tbody>${rows}</tbody>
-        </table>`;
+      document.getElementById("logs").innerHTML = `<table>
+        <thead><tr><th>Time</th><th>Scenario</th><th>Status</th><th>TTFT</th><th>Total</th><th>Error</th></tr></thead>
+        <tbody>${data.rows.map((r) => `<tr>
+          <td>${(r.created_at || "").slice(11, 19)}</td>
+          <td>${r.scenario || ""}</td>
+          <td>${r.status || ""}</td>
+          <td>${r.ttft_ms ?? "—"}</td>
+          <td>${r.total_ms ?? "—"}</td>
+          <td class="err">${r.error || ""}</td>
+        </tr>`).join("")}</tbody></table>`;
     }
 
     document.getElementById("refreshLogs").onclick = loadLogs;
 
     (async () => {
-      await loadHealth();
-      const data = await fetch("/demos").then((r) => r.json());
-      scenarios = data.scenarios;
+      const h = await fetch("/health").then((r) => r.json());
+      document.getElementById("status").innerHTML =
+        `<span class="pill">DB: ${h.database || "off"}</span>
+         <span class="pill">Key: ${h.gateway_key ? "set" : "missing"}</span>
+         <span class="pill">Model: ${h.model}</span>`;
+      const { scenarios } = await fetch("/demos").then((r) => r.json());
       const nav = document.getElementById("nav");
-      nav.innerHTML = scenarios.map((s) =>
-        `<button type="button" data-id="${s.id}">${s.title}</button>`
-      ).join("");
+      nav.innerHTML = scenarios.map((s) => `<button type="button" data-id="${s.id}">${s.title}</button>`).join("");
       nav.querySelectorAll("button").forEach((b) => {
         b.onclick = () => render(scenarios.find((s) => s.id === b.dataset.id));
       });

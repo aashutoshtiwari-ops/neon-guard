@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import threading
 import time
@@ -6,17 +5,12 @@ import time
 from app.config import DATABASE_URL
 
 log = logging.getLogger("chat-proxy")
-_schema_ready = False
-_pool_lock = threading.Lock()
-_pool_conn = None
-_hold_sem: asyncio.Semaphore | None = None
+_ready = False
+_lock = threading.Lock()
+_conn = None
 
 
-def configured() -> bool:
-    return bool(DATABASE_URL)
-
-
-def _url() -> str:
+def _dsn() -> str:
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set")
     if "sslmode=" in DATABASE_URL:
@@ -25,14 +19,14 @@ def _url() -> str:
     return f"{DATABASE_URL}{sep}sslmode=require"
 
 
-def connect_fresh():
+def _connect():
     import psycopg
 
-    return psycopg.connect(_url(), connect_timeout=10)
+    return psycopg.connect(_dsn(), connect_timeout=10)
 
 
-def _ensure_schema(conn) -> None:
-    global _schema_ready
+def _schema(conn) -> None:
+    global _ready
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS request_logs (
@@ -54,129 +48,47 @@ def _ensure_schema(conn) -> None:
     conn.execute("CREATE TABLE IF NOT EXISTS allowlist (id TEXT PRIMARY KEY)")
     conn.execute("INSERT INTO allowlist (id) VALUES ('demo') ON CONFLICT DO NOTHING")
     conn.commit()
-    _schema_ready = True
+    _ready = True
 
 
-def ensure_schema() -> None:
-    if not DATABASE_URL or _schema_ready:
-        return
-    with connect_fresh() as conn:
-        _ensure_schema(conn)
-
-
-def _pooled() -> object:
-    global _pool_conn
-    import psycopg
-
-    if _pool_conn is None or _pool_conn.closed:
-        _pool_conn = psycopg.connect(_url(), connect_timeout=10)
-        _ensure_schema(_pool_conn)
-    return _pool_conn
-
-
-def warmup() -> dict:
+def check_allowlist() -> int:
+    """Pooled SELECT. Returns elapsed ms. 0 if DATABASE_URL is unset."""
     if not DATABASE_URL:
-        return {"ok": False, "error": "DATABASE_URL is not set"}
+        return 0
     t0 = time.perf_counter()
-    with _pool_lock:
-        _pooled()
-        _pooled().execute("SELECT id FROM allowlist WHERE id = %s", ("demo",)).fetchone()
-    return {"ok": True, "ms": int((time.perf_counter() - t0) * 1000)}
+    with _lock:
+        global _conn
+        if _conn is None or _conn.closed:
+            _conn = _connect()
+            _schema(_conn)
+        row = _conn.execute("SELECT id FROM allowlist WHERE id = %s", ("demo",)).fetchone()
+    if not row:
+        raise PermissionError("not on allowlist")
+    return int((time.perf_counter() - t0) * 1000)
 
 
-def ping(mode: str) -> dict:
+def check_allowlist_blocking() -> int:
+    """Sync connect + SELECT on the caller’s thread (freezes asyncio if used on the loop)."""
     if not DATABASE_URL:
-        return {"ok": False, "error": "DATABASE_URL is not set"}
-    if mode == "pooled":
-        return {"ok": True, "mode": "pooled", **timed_lookup(fresh=False)}
-    return {"ok": True, "mode": "fresh", **timed_lookup(fresh=True)}
-
-
-def timed_lookup(*, fresh: bool, round_trips: int = 1) -> dict:
-    empty = {"connect_ms": 0, "query_ms": 0, "round_trips": round_trips, "pool_wait_ms": 0}
-    if not DATABASE_URL:
-        return empty
-    if fresh:
-        t_connect = time.perf_counter()
-        conn = connect_fresh()
-        connect_ms = int((time.perf_counter() - t_connect) * 1000)
-        own = True
-    else:
-        _pool_lock.acquire()
-        conn = _pooled()
-        connect_ms = 0
-        own = False
-    try:
-        if not _schema_ready:
-            _ensure_schema(conn)
-        t_query = time.perf_counter()
-        row = None
-        for _ in range(round_trips):
-            row = conn.execute("SELECT id FROM allowlist WHERE id = %s", ("demo",)).fetchone()
-        query_ms = int((time.perf_counter() - t_query) * 1000)
-        if not row:
-            raise PermissionError("not on allowlist")
-        return {
-            "connect_ms": connect_ms,
-            "query_ms": query_ms,
-            "round_trips": round_trips,
-            "pool_wait_ms": 0,
-        }
-    finally:
-        if own:
-            conn.close()
-        else:
-            _pool_lock.release()
-
-
-def stall_sync() -> dict:
-    """Blocking Neon work meant to freeze the asyncio loop."""
+        time.sleep(1)
+        return 1000
     t0 = time.perf_counter()
-    conn = connect_fresh()
-    connect_ms = int((time.perf_counter() - t0) * 1000)
-    try:
-        if not _schema_ready:
-            _ensure_schema(conn)
+    with _connect() as conn:
+        if not _ready:
+            _schema(conn)
         conn.execute("SELECT id FROM allowlist WHERE id = %s", ("demo",)).fetchone()
-        t_sleep = time.perf_counter()
         conn.execute("SELECT pg_sleep(1)")
         conn.commit()
-        query_ms = int((time.perf_counter() - t_sleep) * 1000)
-    finally:
-        conn.close()
-    return {
-        "connect_ms": connect_ms,
-        "query_ms": query_ms,
-        "round_trips": 2,
-        "pool_wait_ms": 0,
-    }
-
-
-def hold_slot() -> asyncio.Semaphore:
-    global _hold_sem
-    if _hold_sem is None:
-        _hold_sem = asyncio.Semaphore(1)
-    return _hold_sem
+    return int((time.perf_counter() - t0) * 1000)
 
 
 def insert_log(row: dict) -> None:
     if not DATABASE_URL:
         return
     try:
-        ensure_schema()
-        record = {
-            "id": row["id"],
-            "model": row.get("model"),
-            "status": row.get("status"),
-            "scenario": row.get("scenario"),
-            "prompt_chars": row.get("prompt_chars"),
-            "ttft_ms": row.get("ttft_ms"),
-            "total_ms": row.get("total_ms"),
-            "input_tokens": row.get("input_tokens"),
-            "output_tokens": row.get("output_tokens"),
-            "error": row.get("error"),
-        }
-        with connect_fresh() as conn:
+        with _connect() as conn:
+            if not _ready:
+                _schema(conn)
             conn.execute(
                 """
                 INSERT INTO request_logs (
@@ -196,7 +108,18 @@ def insert_log(row: dict) -> None:
                     output_tokens = EXCLUDED.output_tokens,
                     error = EXCLUDED.error
                 """,
-                record,
+                {
+                    "id": row["id"],
+                    "model": row.get("model"),
+                    "status": row.get("status"),
+                    "scenario": row.get("scenario"),
+                    "prompt_chars": row.get("prompt_chars"),
+                    "ttft_ms": row.get("ttft_ms"),
+                    "total_ms": row.get("total_ms"),
+                    "input_tokens": row.get("input_tokens"),
+                    "output_tokens": row.get("output_tokens"),
+                    "error": row.get("error"),
+                },
             )
             conn.commit()
     except Exception:
@@ -207,8 +130,9 @@ def list_logs(limit: int = 50) -> list[dict]:
     if not DATABASE_URL:
         return []
     try:
-        ensure_schema()
-        with connect_fresh() as conn:
+        with _connect() as conn:
+            if not _ready:
+                _schema(conn)
             rows = conn.execute(
                 """
                 SELECT id, created_at, model, status, scenario, prompt_chars, ttft_ms,
