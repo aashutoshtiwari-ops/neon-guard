@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 import time
 
@@ -8,6 +9,10 @@ log = logging.getLogger("chat-proxy")
 _ready = False
 _lock = threading.Lock()
 _conn = None
+
+
+def platform() -> str:
+    return "cloudrun" if os.getenv("K_SERVICE") else "vm"
 
 
 def _dsn() -> str:
@@ -51,35 +56,51 @@ def _schema(conn) -> None:
     _ready = True
 
 
-def check_allowlist() -> int:
-    """Pooled SELECT. Returns elapsed ms. 0 if DATABASE_URL is unset."""
-    if not DATABASE_URL:
-        return 0
-    t0 = time.perf_counter()
+def drop_pool() -> None:
+    global _conn
     with _lock:
-        global _conn
-        if _conn is None or _conn.closed:
-            _conn = _connect()
-            _schema(_conn)
-        row = _conn.execute("SELECT id FROM allowlist WHERE id = %s", ("demo",)).fetchone()
-    if not row:
-        raise PermissionError("not on allowlist")
-    return int((time.perf_counter() - t0) * 1000)
+        if _conn is not None and not _conn.closed:
+            try:
+                _conn.close()
+            except Exception:
+                pass
+        _conn = None
 
 
-def check_allowlist_blocking() -> int:
-    """Sync connect + SELECT on the caller’s thread (freezes asyncio if used on the loop)."""
+def ping() -> dict:
+    """Time a new TCP+TLS+auth through whatever path Cloud Run uses (NAT if configured)."""
+    empty = {"ok": False, "connect_ms": 0, "query_ms": 0, "error": "DATABASE_URL is not set"}
     if not DATABASE_URL:
-        time.sleep(1)
-        return 1000
+        return empty
     t0 = time.perf_counter()
-    with _connect() as conn:
+    conn = _connect()
+    connect_ms = int((time.perf_counter() - t0) * 1000)
+    try:
         if not _ready:
             _schema(conn)
-        conn.execute("SELECT id FROM allowlist WHERE id = %s", ("demo",)).fetchone()
-        conn.execute("SELECT pg_sleep(1)")
-        conn.commit()
-    return int((time.perf_counter() - t0) * 1000)
+        t1 = time.perf_counter()
+        row = conn.execute("SELECT id FROM allowlist WHERE id = %s", ("demo",)).fetchone()
+        query_ms = int((time.perf_counter() - t1) * 1000)
+        if not row:
+            raise PermissionError("not on allowlist")
+        return {"ok": True, "connect_ms": connect_ms, "query_ms": query_ms}
+    finally:
+        conn.close()
+
+
+def check_allowlist_fresh() -> dict:
+    if not DATABASE_URL:
+        return {"connect_ms": 0, "query_ms": 0}
+    result = ping()
+    if not result.get("ok"):
+        raise RuntimeError(result.get("error") or "allowlist ping failed")
+    return {"connect_ms": result["connect_ms"], "query_ms": result["query_ms"]}
+
+
+def check_allowlist_bg() -> None:
+    if not DATABASE_URL:
+        return
+    ping()
 
 
 def insert_log(row: dict) -> None:

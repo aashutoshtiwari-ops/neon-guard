@@ -7,7 +7,7 @@ import httpx
 
 from app.catalog import SCENARIOS
 from app.config import API_KEY, GATEWAY_URL, MODEL
-from app.neon import check_allowlist, check_allowlist_blocking, insert_log
+from app.neon import check_allowlist_bg, check_allowlist_fresh, drop_pool, insert_log
 
 IDS = {s["id"] for s in SCENARIOS}
 
@@ -17,7 +17,7 @@ def _chars(messages: list) -> int:
 
 
 async def stream_completion(messages: list, model: str | None = None, scenario: str = "good", role: str = "solo"):
-    if scenario not in IDS:
+    if scenario not in IDS or scenario == "timeout":
         scenario = "good"
     ctx = {
         "id": str(uuid.uuid4()),
@@ -27,12 +27,13 @@ async def stream_completion(messages: list, model: str | None = None, scenario: 
         "role": role,
         "t0": time.perf_counter(),
         "ttft_ms": None,
-        "allowlist_ms": 0,
+        "connect_ms": 0,
+        "query_ms": 0,
         "usage": {},
         "error": None,
         "status": "ok",
     }
-    run = {"good": _good, "serial": _serial, "gather": _gather, "sync": _sync}[scenario]
+    run = {"good": _good, "nat": _nat, "scale": _scale}[scenario]
     try:
         async for chunk in run(ctx):
             yield chunk
@@ -41,35 +42,30 @@ async def stream_completion(messages: list, model: str | None = None, scenario: 
         ctx["error"] = str(exc)
         yield f"data: {json.dumps({'error': str(exc)})}\n\n"
     finally:
-        row = {
-            "id": ctx["id"],
-            "model": ctx["model"],
-            "status": ctx["status"],
-            "scenario": ctx["scenario"] if ctx["role"] == "solo" else f"{ctx['scenario']}:{ctx['role']}",
-            "prompt_chars": _chars(ctx["messages"]),
-            "ttft_ms": ctx["ttft_ms"],
-            "total_ms": int((time.perf_counter() - ctx["t0"]) * 1000),
-            "input_tokens": ctx["usage"].get("prompt_tokens"),
-            "output_tokens": ctx["usage"].get("completion_tokens"),
-            "error": ctx["error"],
-        }
-        if scenario == "sync" and role == "blocker":
-            insert_log(row)
-        else:
-            await asyncio.to_thread(insert_log, row)
-
-
-async def _allowlist() -> int:
-    return await asyncio.to_thread(check_allowlist)
+        await asyncio.to_thread(
+            insert_log,
+            {
+                "id": ctx["id"],
+                "model": ctx["model"],
+                "status": ctx["status"],
+                "scenario": ctx["scenario"],
+                "prompt_chars": _chars(ctx["messages"]),
+                "ttft_ms": ctx["ttft_ms"],
+                "total_ms": int((time.perf_counter() - ctx["t0"]) * 1000),
+                "input_tokens": ctx["usage"].get("prompt_tokens"),
+                "output_tokens": ctx["usage"].get("completion_tokens"),
+                "error": ctx["error"],
+            },
+        )
 
 
 def _meta(ctx: dict) -> str:
     body = {
         "id": ctx["id"],
         "ttft_ms": ctx["ttft_ms"],
-        "allowlist_ms": ctx["allowlist_ms"],
+        "connect_ms": ctx["connect_ms"],
+        "query_ms": ctx["query_ms"],
         "scenario": ctx["scenario"],
-        "role": ctx["role"],
     }
     return f"event: meta\ndata: {json.dumps(body)}\n\n"
 
@@ -103,59 +99,24 @@ async def _llm(ctx: dict):
 
 
 async def _good(ctx: dict):
-    task = asyncio.create_task(_allowlist())
+    task = asyncio.create_task(asyncio.to_thread(check_allowlist_bg))
     task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
     async for chunk in _llm(ctx):
         yield chunk
 
 
-async def _serial(ctx: dict):
-    ctx["allowlist_ms"] = await _allowlist()
+async def _nat(ctx: dict):
+    timing = await asyncio.to_thread(check_allowlist_fresh)
+    ctx["connect_ms"] = timing["connect_ms"]
+    ctx["query_ms"] = timing["query_ms"]
     async for chunk in _llm(ctx):
         yield chunk
 
 
-async def _gather(ctx: dict):
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": ctx["model"],
-        "messages": ctx["messages"],
-        "stream": True,
-        "stream_options": {"include_usage": True},
-    }
-    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
-        req = client.build_request("POST", GATEWAY_URL, headers=headers, json=payload)
-        ctx["allowlist_ms"], resp = await asyncio.gather(_allowlist(), client.send(req, stream=True))
-        try:
-            if resp.status_code >= 400:
-                raw = (await resp.aread()).decode("utf-8", errors="replace")
-                ctx["status"] = "error"
-                ctx["error"] = f"gateway {resp.status_code}: {raw[:500]}"
-                yield f"data: {json.dumps({'error': ctx['error']})}\n\n"
-                return
-            first = False
-            async for chunk in resp.aiter_bytes():
-                if not chunk:
-                    continue
-                if not first:
-                    ctx["ttft_ms"] = int((time.perf_counter() - ctx["t0"]) * 1000)
-                    first = True
-                    yield _meta(ctx)
-                yield chunk
-                _usage(chunk, ctx["usage"])
-        finally:
-            await resp.aclose()
-
-
-async def _sync(ctx: dict):
-    if ctx["role"] != "blocker":
-        async for chunk in _good(ctx):
-            yield chunk
-        return
-    ctx["ttft_ms"] = int((time.perf_counter() - ctx["t0"]) * 1000)
-    yield _meta(ctx)
-    ctx["allowlist_ms"] = check_allowlist_blocking()
-    ctx["status"] = "sync_stall"
+async def _scale(ctx: dict):
+    await asyncio.to_thread(drop_pool)
+    async for chunk in _nat(ctx):
+        yield chunk
 
 
 def _usage(chunk: bytes, usage: dict) -> None:

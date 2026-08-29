@@ -1,4 +1,5 @@
 import logging
+import os
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -7,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from app.catalog import SCENARIOS
 from app.config import API_KEY, DATABASE_URL, MODEL, STATIC_DIR
 from app.gateway import stream_completion
-from app.neon import list_logs
+from app.neon import list_logs, ping, platform
 
 logging.basicConfig(level=logging.INFO)
 
@@ -22,12 +23,24 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "model": MODEL, "gateway_key": bool(API_KEY), "database": "neon" if DATABASE_URL else None}
+    return {
+        "ok": True,
+        "model": MODEL,
+        "gateway_key": bool(API_KEY),
+        "database": "neon" if DATABASE_URL else None,
+        "platform": platform(),
+        "service": os.getenv("K_SERVICE"),
+    }
 
 
 @app.get("/demos")
 def demos():
     return {"scenarios": SCENARIOS}
+
+
+@app.post("/demos/ping")
+def demos_ping():
+    return ping()
 
 
 @app.get("/requests")

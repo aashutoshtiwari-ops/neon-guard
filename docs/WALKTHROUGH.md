@@ -1,43 +1,58 @@
-# Allow-list vs TTFT — live demo script
+# Cloud Run + Neon IP allow list — demo script
 
-This is the talk track. The app is small on purpose: **the same Postgres allow-list `SELECT`**, written four different ways, and what that does to **time to first token (TTFT)**.
+This demo is **only** TTFT problems that appear when the app runs on **Cloud Run** and Neon **IP Allow List** is on. It is not the VM “await vs gather vs sync driver” talk.
 
-Run the four cards **top to bottom**. Write down numbers as you go; later cards only make sense against card 1.
+Run cards **top to bottom**. Quote **connect_ms** vs **query_ms**. Model TTFT still jitters (~1s ± a few hundred ms); do not compare raw TTFT across minutes without looking at connect_ms.
 
----
-
-## What this demo is (and is not)
-
-**Is:** How *application code* that gates a chat request on an allow-list can delay the first model token — or delay *someone else’s* first token.
-
-**Is not:** Neon Scale IP Allow List as extra latency. If this GCP VM’s public IP is on Neon’s list, connections from the VM are simply **allowed**. That is a pass/fail door, not a hop. You need it so `DATABASE_URL` works. You are not measuring it.
-
-**Is not:** Cold compute, connection-pooler vs direct URL, NAT in front of serverless, or “the SQL is slow.” Each card uses the same tiny `SELECT id FROM allowlist WHERE id = 'demo'`.
-
-The story: *“We added an allow-list in Neon. If we put that check on the path to the first token — or we call it with a blocking driver on the event loop — TTFT gets worse. Here are the exact code shapes.”*
+The health pill should say **Cloud Run** (`K_SERVICE` is set). If it says **VM**, you are not on the path this script is about.
 
 ---
 
-## Before the room sits down
+## Why Cloud Run is different from the GCP VM
 
-1. App is running with **one uvicorn worker** (default). Pair demo (card 4) is wrong with multiple workers.
-2. Open the UI (`/`). Pills should show **DB: neon** and **Key: set**.
-3. Leave the prompt as the default one-sentence question unless you need a shorter stream.
-4. Have a notepad or the “Recent requests” table for TTFT numbers. After each successful run, **Refresh logs** if you want a paper trail; it is optional and talks to Neon (fine after you no longer care about a cold start).
+On the VM you listed a **stable public IP**. Neon accepts that IP. Traffic is **VM → Neon**. No extra box.
 
-If DB is `off`, allow-list calls no-op (`allowlist_ms` stays 0) and cards 2–4 will not move. Fix `DATABASE_URL` first.
+Cloud Run tasks do **not** have a stable public IP. Egress IPs rotate. You cannot put “the Cloud Run IP” on Neon’s list the way you did for the VM.
+
+To keep IP Allow List, you typically:
+
+1. Attach a **Serverless VPC Access connector** (or Direct VPC egress).
+2. Send outbound traffic through **Cloud NAT** with a **reserved static IP**.
+3. Put **that NAT IP** on Neon’s allow list.
+
+Every **new** Postgres connection is then:
+
+**Cloud Run instance → VPC connector → Cloud NAT → internet → Neon**
+
+That extra hop (plus TLS) is what cards 2–3 measure. Card 4 is what happens if a request does **not** leave through that NAT IP.
+
+Not in this demo (same on VM or not caused by the IP list): gather-then-yield, sync event-loop stalls, “SQL is slow,” Neon compute suspend (unless you hit it by accident).
 
 ---
 
-## How to read the metrics
+## What must be true in GCP / Neon
+
+1. Cloud Run service, image from this repo’s `Dockerfile` (listens on `$PORT`).
+2. VPC connector (or Direct VPC) on the service.
+3. Cloud NAT on the same network/region, static IP reserved.
+4. Neon Scale **IP Allow List** contains **only** that NAT IP (not the old VM IP unless you still use the VM).
+5. `DATABASE_URL` on the Cloud Run service.
+6. For card 3’s real scale-to-zero: **min instances = 0** (and be willing to wait for idle).
+
+If IP Allow List is off, card 2 still times a connect, but you are no longer proving the NAT requirement.
+
+---
+
+## Metrics
 
 | Field | Meaning |
 | --- | --- |
-| **TTFT ms** | Server clock: request handler starts → first SSE `meta` event. For a single chat, this is the number to quote. |
-| **client TTFT ms** | Browser clock: `fetch` starts → first `meta`. Use this on **card 4**. The victim’s wait includes time the server loop was frozen *before* the victim handler could finish producing the first token, and also queueing in the browser/network. |
-| **allowlist_ms** | Time spent in the allow-list function *on this request’s critical path*. Card 1 reports **0** here even though a background check still runs — that is the point. Cards 2–3 report the pooled `SELECT`. Card 4’s blocker reports the sync call (including `pg_sleep(1)`). |
+| **TTFT ms** | Handler start → first SSE `meta` (includes model if you clicked Run). |
+| **client TTFT ms** | Browser `fetch` → first `meta`. |
+| **connect_ms** | New `psycopg.connect()`: TCP + TLS + auth **through NAT** (when configured). This is the IP-allow-list tax. |
+| **query_ms** | The `SELECT` after the socket is up. Should stay small. |
 
-Model TTFT itself jitters (load, region, gateway). Always compare **the same session**, card 1 vs 2 vs 3, not a number from yesterday.
+**DB ping (no model)** is the clean measurement. Use it when model jitter hides a 50–200 ms connect.
 
 ---
 
@@ -45,179 +60,124 @@ Model TTFT itself jitters (load, region, gateway). Always compare **the same ses
 
 ### What you are proving
 
-The allow-list does **not** have to sit in front of the first token. Start the model stream immediately; run `SELECT` in the background (`asyncio.create_task` + `to_thread`). Logging after the stream also uses `to_thread`, so it does not freeze the loop.
-
-This is the **only** number the rest of the demo is allowed to beat.
-
-### What the code does
-
-```text
-create_task(allowlist())          # do not await
-async for token in model.stream():
-    yield token                   # first yield is TTFT
-```
+The IP allow list / NAT path cannot delay the first token if the handler **does not wait** on a new Neon connection before streaming.
 
 ### Steps
 
-1. Click **1. Don’t wait**.
-2. Click **Run**. Wait until tokens appear and the metrics row fills in.
-3. Write down **TTFT ms** and **client TTFT ms**. Ignore this first run if it looks like an outlier (cold model / first HTTP to the gateway).
-4. Click **Run** again.
-5. Write down the **second** TTFT. That is **Baseline B**. Say it out loud: “This is model time only.”
+1. Confirm the pill says **Cloud Run**.
+2. Click **1. Don’t wait**.
+3. **Run** twice. Keep the second **TTFT** as the model band (it will still move).
+4. **connect_ms** and **query_ms** on the strip should be **0**.
 
-### What you should see
+### See
 
-- **allowlist_ms = 0** on the metric strip (not on the critical path).
-- Tokens start as fast as the model/gateway allow.
-- A reply still streams; the check happened, it just did not block TTFT.
-- Status in logs: `good` (or `ok` with scenario `good`).
+TTFT ≈ model only. Background ping may still open a NAT connection; it must not sit in front of the first token.
 
-### If it looks wrong
+### Say
 
-- No stream / gateway error: API key or model, not Neon.
-- `allowlist_ms` not 0: you are on the wrong card.
-
-**Talking point:** *“The product still enforced allow-list. We did not make TTFT wait for Postgres.”*
+*“IP allow list is on. We still don’t make the user wait for NAT+TLS before tokens.”*
 
 ---
 
-## Card 2 — Await, then stream
+## Card 2 — New connect via NAT
 
 ### What you are proving
 
-The classic bug: **same query**, wrong place on the timeline. The handler `await`s the allow-list, *then* opens the model. Every millisecond of that `SELECT` (and pool checkout) is added to TTFT.
+The usual Cloud Run + IP allow list design: **static NAT**, and a **new Postgres connection** on the allow-list / auth path before the model. The bottleneck is **connect_ms** (NAT + TLS), not the `SELECT`.
 
-This is not “Neon is slow SQL.” It is **order**.
-
-### What the code does
-
-```text
-allowlist_ms = await allowlist()  # must finish
-async for token in model.stream():
-    yield token
-```
-
-The allow-list still runs in a worker thread (`to_thread`), so this card does **not** freeze other requests. It only delays **this** chat’s first token.
+On the VM with a listed public IP, this handshake had no NAT gateway. Here it does.
 
 ### Steps
 
-1. Click **2. Await, then stream**.
-2. Click **Run** once (twice if the first run looks noisy).
-3. Put **TTFT ms** next to Baseline B.
-4. Look at **allowlist_ms** on the same row.
+1. Click **2. New connect via NAT**.
+2. Click **DB ping (no model)** two or three times. Write **connect_ms** and **query_ms**.
+3. Click **Run**. Compare **TTFT** to card 1’s band. The extra should be about **connect_ms** (model noise still applies). Point at **connect_ms ≫ query_ms** on the same row.
 
-### What you should see
+### See
 
-- **TTFT ≈ Baseline B + allowlist_ms** (plus a little jitter).
-- **allowlist_ms** is typically tens of milliseconds on a warm pool from this VM, sometimes more. Even a small add is the mechanism; you do not need a huge number.
-- Logs scenario: `serial`.
+| | Typical |
+| --- | --- |
+| query_ms | small (single-digit to tens of ms) |
+| connect_ms | larger (often tens to hundreds of ms; more if NAT/region is far from Neon) |
 
-### What to say
+If ping **fails** or hangs ~10s, you are already on card 4 (egress IP not listed).
 
-*“We didn’t change the query. We waited for it before we were allowed to start the model. TTFT is now model plus allow-list.”*
+### Say
 
-### If it looks wrong
-
-- TTFT ≈ card 1 and **allowlist_ms = 0**: `DATABASE_URL` missing.
-- TTFT much larger than allowlist_ms extra: model jitter. Run card 1 again, then card 2 again, same minute.
+*“We didn’t make the query expensive. We opened a new connection through Cloud NAT because that’s how Cloud Run satisfies Neon’s IP list.”*
 
 ---
 
-## Card 3 — Gather, then yield
+## Card 3 — New Cloud Run instance
 
 ### What you are proving
 
-A common “fix” that is not a fix: start allow-list and the model HTTP connect **at the same time**, but **do not yield any token until both have finished**.
+A VM process can keep a socket for days. Cloud Run **throws the process away** (scale to zero, new instance for load, deploy). The next request has **no pool**. First checkout is another full NAT+TLS connect (card 2), sometimes plus **container start** (not the IP list, but it stacks).
 
-```text
-allowlist, stream = await gather(allowlist(), open_model())
-async for token in stream:
-    yield token   # first yield is after gather returns
-```
+The in-app **Run** drops any in-process socket and connects again — the **database** part of a new instance. It does **not** simulate Cloud Run’s own cold start.
 
-Parallel work. **TTFT still waits for the slower of the two.** If the allow-list is slower than “open the stream,” this looks as bad as card 2. If the allow-list is faster, it may look close to card 1 — which is why you already showed card 2, and why you say the sentence below.
+### Steps (in-app stand-in)
 
-True overlap (card 1) is: **yield as soon as the model has a token**, even if allow-list is still running (and abort later if denied).
+1. Click **3. New Cloud Run instance**.
+2. **Run** (or ping). Expect **connect_ms** in the same ballpark as card 2.
 
-### Steps
+### Steps (real scale-to-zero)
 
-1. Click **3. Gather, then yield**.
-2. Click **Run**.
-3. Compare **TTFT** to Baseline B and to card 2.
-4. Note **allowlist_ms** (time for the check that ran inside `gather`).
+1. Cloud Run: min instances **0**.
+2. Stop traffic until the revision shows 0 instances (often many minutes).
+3. One **DB ping** or **Run** on card 3. First hit = container start + NAT connect. Second hit on the **same** instance should drop container-start cost; connect_ms stays if you still open a new TCP each time (this app’s ping always does).
 
-### What you should see
+### See
 
-- TTFT is **at least** as large as the slower of {allow-list, time to first model byte after connect}.
-- It should **not** be better than card 1 in a systematic way.
-- If Neon is fast from this VM, gather may look **near** card 1. That is honest: the bug is the **join before first yield**, not “gather always adds 200ms.” Say: *“We still coupled first token to both finishing. We got lucky if Postgres was faster than the model.”*
-- Logs scenario: `gather`.
+Same shape as card 2 for the DB handshake. Real idle adds a large jump once (Cloud Run), then card-2-like connects.
 
-### What to say
+### Say
 
-*“asyncio.gather does not mean the user sees a token sooner. It means we wait for max(db, model-connect) before we are allowed to stream.”*
+*“The allow list forced NAT. Cloud Run makes us pay that handshake every time we get a new instance, not once per VM lifetime.”*
 
 ---
 
-## Card 4 — Sync allow-list (pair)
+## Card 4 — Egress IP not listed (talk only)
 
 ### What you are proving
 
-This is **not** “await allow-list then stream” (that was card 2). This is: a **blocking** allow-list (`psycopg.connect` + `SELECT` on the asyncio thread) so **another** request cannot run.
+IP allow list is a **door**. Cloud Run’s **default internet egress IPs are not the NAT IP**. If the service is not actually sending Postgres through that NAT, Neon refuses the connection. This app waits up to **10s** (`connect_timeout`). If that wait is before the first token, TTFT is ~10s or the request errors.
 
-Card 2 delays **this** user. Card 4 delays **the other** user, even when that other user wrote card-1-correct code.
+Do **not** turn off the connector mid-demo unless you want a hard fail.
 
-`pg_sleep(1)` is only so the stall is obvious in a noisy room. The bug is **sync I/O on the loop**; a slow TLS handshake would do the same.
+### When it happens
 
-### Why one click cannot be a single request
+- IP allow list on, Cloud Run **without** VPC/NAT (rotating Google egress IPs).
+- Connector attached but **VPC egress** still “public” for the Neon destination so traffic skips NAT.
+- Neon list still has the **VM IP** and not the **NAT IP**.
+- NAT IP changed and the list was not updated.
 
-One HTTP handler cannot be both the stall and the victim. **Run pair**:
+### See (if you ever reproduce)
 
-1. **Victim** starts first: same path as card 1 (stream, don’t wait on allow-list).
-2. After ~80ms, **blocker** sends a `meta` immediately, then runs the **sync** allow-list on the loop (no model).
+Ping/Run errors or ~10s delay. **query_ms** never appears. Not a slow `SELECT`.
 
-While the blocker is inside `connect` / `SELECT` / `pg_sleep(1)`, the loop cannot resume the victim’s `await` on the model stream, so the victim’s first token is late.
+### Say
 
-### Steps
-
-1. You already have Baseline B from card 1. If it has been a while, run card 1 once more and update B.
-2. Click **4. Sync allow-list (pair)**.
-3. Click **Run pair** once. Do not click Run twice overlapping; let the pair finish.
-4. Read **two** metric blocks: Victim, then Blocker.
-
-### What you should see
-
-| | TTFT ms | client TTFT ms | allowlist_ms |
-| --- | --- | --- | --- |
-| **Blocker** | tiny (it yields `meta` before the stall) | small | ~1000+ (sleep + connect) |
-| **Victim** | ~1s above Baseline B if the stall overlapped waiting for the first token | **this is the slide number** | 0 on the critical path |
-
-- Victim still never `await`ed the allow-list. Their inflation is **someone else’s sync call**.
-- Logs: `sync:victim` and `sync:blocker` (blocker status `sync_stall`).
-
-### What to say
-
-*“Logging or allow-list with a sync driver after you think you’re done still shares the event loop. The next chat’s TTFT includes your `connect()`.”*
-
-### If it looks wrong
-
-- Victim **not** ~1s slower: **more than one uvicorn worker**, or the pair did not overlap (clicked wrong). Confirm one worker; use only **Run pair**.
-- Both fail: Neon/IP allow list or network; blocker needs a real connect unless `DATABASE_URL` is unset (then it still `sleep(1)`).
-- You compared server TTFT only and it looks mild: quote **victim client TTFT** vs card 1 **client TTFT**.
+*“On the VM, listing the VM IP was enough. On Cloud Run, listing the wrong IP looks like a TTFT disaster.”*
 
 ---
 
-## Suggested 5-minute spine
+## Suggested spine (about 5 minutes)
 
-1. Card 1 twice → “Baseline B, allow-list off the path.”
-2. Card 2 → “Same SELECT, we waited. TTFT += allowlist_ms.”
-3. Card 3 → “Gather still joins before the first token.”
-4. Card 4 → “Sync check on the loop taxes the *other* request. One worker, Run pair, look at victim client TTFT.”
+1. Pill: Cloud Run. Card 1 twice — “NAT is not on TTFT.”
+2. Card 2 ping — “connect_ms is the allow-list path; query_ms is noise.”
+3. Card 2 Run — TTFT includes that connect.
+4. Card 3 — new instance = pay connect again; real zero-instance optional.
+5. Card 4 — talk: default Cloud Run IPs vs NAT IP.
 
-Close: *“Correct shape is card 1: start the stream; don’t await the allow-list before the first token; don’t put blocking Postgres on the event loop.”*
+Close: *“If you need Neon IP allow list on Cloud Run, you take NAT. Don’t put a new connect on the first-token path (card 1). Don’t skip NAT and hope rotating IPs match the list (card 4).”*
 
 ---
 
-## After the demo (optional)
+## If numbers look wrong
 
-Refresh logs and walk the scenario column: `good`, `serial`, `gather`, `sync:victim`, `sync:blocker`. Same table, four code paths.
+- Pill says **VM** — you are not measuring Cloud Run NAT.
+- **connect_ms** tiny and you expected NAT — traffic may be going **direct** (allow list off, or not via NAT). Compare to ping from the old VM.
+- Card 1 **TTFT** jumps around — model jitter; ignore for this story except as a band.
+- Ping hangs 10s — card 4; fix NAT IP on Neon’s list.
+- Refresh logs does **not** clear rows; it only reloads the last 20.
