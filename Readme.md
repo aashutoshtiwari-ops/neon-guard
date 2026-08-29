@@ -1,8 +1,6 @@
 # Chat proxy
 
-Cloud Run + Neon **IP Allow List** TTFT demo: extra hop via Cloud NAT, new instances paying that handshake again, and connect timeout if egress is not the listed NAT IP.
-
-Walkthrough: [docs/WALKTHROUGH.md](docs/WALKTHROUGH.md).
+Demo app: Neon IP allow list on Cloud Run and TTFT. Full setup and talk track: [docs/WALKTHROUGH.md](docs/WALKTHROUGH.md).
 
 ## Cloud Run
 
