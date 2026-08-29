@@ -59,3 +59,4 @@ async def chat_completions(request: Request):
         stream_completion(body.get("messages") or [], body.get("model"), scenario=scenario, role=role),
         media_type="text/event-stream",
     )
+# other optimisations: private path (not possible in gcp), vm usage (no need for nat), only use username and pass (weak auth than ip allow list) 
