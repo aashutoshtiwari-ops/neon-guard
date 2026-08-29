@@ -67,6 +67,41 @@ def drop_pool() -> None:
         _conn = None
 
 
+def _pooled_conn():
+    global _conn
+    if _conn is None or _conn.closed:
+        t0 = time.perf_counter()
+        _conn = _connect()
+        _schema(_conn)
+        return _conn, int((time.perf_counter() - t0) * 1000)
+    return _conn, 0
+
+
+def warmup() -> dict:
+    if not DATABASE_URL:
+        return {"ok": False, "error": "DATABASE_URL is not set"}
+    with _lock:
+        conn, connect_ms = _pooled_conn()
+        t1 = time.perf_counter()
+        conn.execute("SELECT id FROM allowlist WHERE id = %s", ("demo",)).fetchone()
+        query_ms = int((time.perf_counter() - t1) * 1000)
+    return {"ok": True, "connect_ms": connect_ms, "query_ms": query_ms}
+
+
+def check_allowlist_pooled() -> dict:
+    """Reuse one connection in this process. connect_ms is 0 after warmup."""
+    if not DATABASE_URL:
+        return {"connect_ms": 0, "query_ms": 0}
+    with _lock:
+        conn, connect_ms = _pooled_conn()
+        t1 = time.perf_counter()
+        row = conn.execute("SELECT id FROM allowlist WHERE id = %s", ("demo",)).fetchone()
+        query_ms = int((time.perf_counter() - t1) * 1000)
+    if not row:
+        raise PermissionError("not on allowlist")
+    return {"connect_ms": connect_ms, "query_ms": query_ms}
+
+
 def ping() -> dict:
     """Time a new TCP+TLS+auth through whatever path Cloud Run uses (NAT if configured)."""
     empty = {"ok": False, "connect_ms": 0, "query_ms": 0, "error": "DATABASE_URL is not set"}
@@ -101,6 +136,29 @@ def check_allowlist_bg() -> None:
     if not DATABASE_URL:
         return
     ping()
+
+
+def fail_unlisted_connect() -> None:
+    """Hang until connect_timeout — same shape as Neon dropping an unlisted IP."""
+    import psycopg
+
+    host = "db.neon.tech"
+    if DATABASE_URL:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(DATABASE_URL.replace("postgres://", "postgresql://", 1))
+        if parsed.hostname:
+            host = parsed.hostname
+    try:
+        psycopg.connect(
+            f"host={host} hostaddr=192.0.2.1 port=5432 user=denied password=denied "
+            "dbname=neondb sslmode=require connect_timeout=5",
+        )
+    except Exception as exc:
+        raise ConnectionError(
+            f"Database connection failed (IP not on allow list). {exc}"
+        ) from exc
+    raise ConnectionError("Database connection failed (IP not on allow list).")
 
 
 def insert_log(row: dict) -> None:

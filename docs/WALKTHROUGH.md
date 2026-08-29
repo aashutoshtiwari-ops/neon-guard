@@ -2,22 +2,20 @@
 
 You already have a GCP project with billing and a Neon Scale database. This document is the full path: **build the network, deploy the app, turn on Neon’s IP allow list, then run the four cards.**
 
-The app streams a chat model and can run a Postgres allow-list `SELECT` in different ways. **TTFT** is time until the first token (SSE `meta`). Model time still jitters; for the allow-list story, trust **connect_ms** vs **query_ms**, and **DB ping** when you do not want the model in the number.
+The app streams a chat model and can talk to Postgres in different ways. **TTFT** is time until the first token. Each **Run 10×** averages ten requests so one noisy model call does not set the story. For cards 2–3, also look at **connect_ms** vs **query_ms**.
 
 ---
 
 ## What you will show
 
-Four implementation choices. Same `SELECT id FROM allowlist WHERE id = 'demo'`.
+| Card | What it shows |
+| --- | --- |
+| **1. Fastest first token** | Chat starts with no wait on the database. TTFT ≈ the model. |
+| **2. Wait for DB, then chat** | Wait for allow-list, then chat. **Reuses** a saved connection. A bit slower than 1. |
+| **3. Brand-new container** | No saved connection. **New** connect every time, then chat. Slower than 2. |
+| **4. Chat starts, then DB fails** | Chat begins; a DB connect never gets through (IP not allowed). Stream stops. TTFT vs time until cutoff. |
 
-| Card | Code path | What TTFT includes |
-| --- | --- | --- |
-| **1. Don’t wait** | Start the model stream. Allow-list runs in the background. | Model only. `connect_ms` = 0. |
-| **2. New connect via NAT** | `await connect()` + `SELECT`, *then* stream. New TCP every time. | Model + **NAT + TLS** (`connect_ms`). Query is cheap. |
-| **3. New Cloud Run instance** | Drop any socket, then the same as card 2. Real version: scale to zero first. | Card 2 again, plus **container start** if the service was at 0 instances. |
-| **4. Egress IP not listed** | Talk only. No Run. | **~10s** `connect_timeout` or error if traffic is not the NAT IP on Neon’s list. |
-
-**One sentence for the room:** *IP allow list on Cloud Run means a static NAT. A new Postgres connection on the first-token path adds that handshake to TTFT. A new instance pays it again. A wrong egress IP looks like a 10 second TTFT.*
+**One sentence:** *Don’t wait on a new DB connection if you want a fast first token. A new container pays that connection again. If the IP is not allowed, you can still start chatting — then the stream is cut when the DB call fails.*
 
 ---
 
@@ -183,10 +181,11 @@ On card 2, click **DB ping (no model)**. You want `ok` with **connect_ms** and *
 
 | Field | Meaning |
 | --- | --- |
-| **TTFT ms** | Server: request start → first SSE `meta`. |
-| **client TTFT ms** | Browser: `fetch` → first `meta`. |
-| **connect_ms** | New `psycopg.connect()` (TCP + TLS + auth via NAT). **This is the allow-list path cost.** |
-| **query_ms** | Time in the `SELECT` after the socket is up. |
+| **TTFT ms** | Average time to first token (10 requests). |
+| **client TTFT ms** | Same, measured in the browser. |
+| **connect_ms** | Average time to open a new database connection. |
+| **query_ms** | Average time for the allow-list `SELECT` after the socket is up. |
+| **stopped ms** | Card 4 only: average time until the chat is cut off. |
 
 **Refresh logs** reloads the last 20 rows. It does **not** delete data.
 
@@ -194,85 +193,67 @@ On card 2, click **DB ping (no model)**. You want `ok` with **connect_ms** and *
 
 ## Part C — Live demo (top to bottom)
 
-Do not click Warm/ping on other cards before you need them. Card 1 first.
+Cards show only **what** they demonstrate. Clicks below. Each **Run 10×** takes a while (ten model calls; card 4 also waits ~5s per call for the failed connect).
 
-### Card 1 — Don’t wait
+### Card 1 — Fastest first token
 
-**Implementation:** `create_task(allowlist)` then stream. Do not `await` Postgres before the first token.
+**Implementation:** Start the model stream at once. Database check runs in the background and is not awaited.
 
-**Do:**
+**Do:** Open the card. **Run 10×**. Wait for “Average of 10 requests”.
 
-1. Open **1. Don’t wait**.
-2. **Run**. Wait for the reply.
-3. **Run** again. Write the second **TTFT** as the model band (it will still move by hundreds of ms).
+**See:** Average TTFT is the model band. **connect_ms** and **query_ms** are 0.
 
-**See:** `connect_ms` = 0, `query_ms` = 0 on the strip. Tokens as fast as the model.
-
-**Say:** *The allow-list still runs. TTFT does not wait for NAT or TLS.*
+**Say:** *This is the fastest first token. We did not wait for the database.*
 
 ---
 
-### Card 2 — New connect via NAT
+### Card 2 — Wait for DB, then chat
 
-**Implementation:** `await connect()` + `SELECT`, then open the model. New connection every Run/ping.
+**Implementation:** `await` the allow-list `SELECT`, then start the model. Uses **one saved connection** in this process. **Run 10×** warms that connection first so the average is not dominated by a single handshake.
 
-**Do:**
+**Do:** **Run 10×**. Compare average TTFT to card 1. **connect_ms** should be ~0; **query_ms** small.
 
-1. Open **2. New connect via NAT**.
-2. **DB ping (no model)** two or three times. Write **connect_ms** and **query_ms**.
-3. **Run**. Point at **connect_ms** on the same row as TTFT.
+**See:** TTFT a bit above card 1 (wait for the query). Much less than a full NAT+TLS connect.
 
-**See:** `connect_ms` ≫ `query_ms`. Ping extra vs card 1 is that connect, not the SQL. TTFT ≈ model band + `connect_ms` (model jitter still applies — if TTFT is noisy, stay on ping).
-
-**Say:** *Same SELECT. We put a new connection on the first-token path. The delay is the handshake through Cloud NAT, which exists so Neon’s IP list has a stable address.*
+**Say:** *We waited for the database, but we reused the connection. Extra TTFT is the SELECT, not a new handshake.*
 
 ---
 
-### Card 3 — New Cloud Run instance
+### Card 3 — Brand-new container
 
-**Implementation:** Drop any in-process socket, then the same as card 2. Cloud Run does this whenever it starts a **new container** (scale from zero, extra instance, new revision).
+**Implementation:** Close the saved connection, then **new** `connect()` + `SELECT` on **every** request, then the model. Same as a new Cloud Run instance with an empty pool.
 
-**Do (stand-in, no waiting):**
+**Do:** **Run 10×**. Compare to cards 1 and 2.
 
-1. Open **3. New Cloud Run instance**.
-2. **Run** or **DB ping**. Expect **connect_ms** like card 2.
+**See:** **connect_ms** large. Average TTFT **higher than card 2**, which is higher than card 1.
 
-**Do (real zero instances):**
-
-1. Leave **min-instances = 0**.
-2. Stop hitting the service until Cloud Run shows **0 instances** (often 10–15+ minutes).
-3. One **DB ping** or **Run**. First hit = container start + NAT connect. Second hit on the same instance: no container start; ping still opens a **new** TCP so **connect_ms** stays.
-
-**See:** Same DB shape as card 2. Real idle adds a one-time jump (Cloud Run start) on the first request.
-
-**Say:** *Every new instance pays a full NAT+TLS connect. We do not keep a VM-sized process around.*
+**Say:** *No saved connection. Every request dials Neon again. That is 3 > 2 > 1.*
 
 ---
 
-### Card 4 — Egress IP not listed
+### Card 4 — Chat starts, then DB fails
 
-**Implementation:** `connect_timeout=10`. If the source IP is not on Neon’s list, the wait is on the critical path whenever you `await connect()` before tokens.
+**Implementation:** Start the model immediately (like card 1). In parallel, try to reach Neon in a way that **never completes** (same timing as an IP that is not on the allow list: wait until `connect_timeout`, here 5s). When that fails, **stop the stream** and show the error.
 
-**Do:** Talk. Do not detach the connector or delete the NAT IP during the talk.
+The default prompt counts at length so you see tokens **before** the cutoff.
 
-**When it happens:** IP allow list on, but Cloud Run not using `all-traffic` + this NAT; or Neon still lists the wrong IP.
+**Do:** Open the card. **Run 10×**. Watch one run: numbers appear, then the error. Then read the averages.
 
-**See (only if you reproduce later):** ping/Run error or ~10s. No useful `query_ms`.
+**See:** **TTFT** is still fast (chat started). **stopped ms** is about 5 seconds (connect timeout). The last sample shows text plus the error.
 
-**Say:** *Wrong egress IP is not a slow query. It is a closed door, and the timeout becomes TTFT.*
+**Say:** *We started chatting without waiting. The database never got in (IP not allowed). The stream stopped. Fast first token does not mean the request finished.*
 
 ---
 
-## Spine (about five minutes)
+## Spine
 
 1. Health: Cloud Run + neon.  
-2. Card 1 twice — TTFT = model; connect 0.  
-3. Card 2 ping — connect_ms vs query_ms.  
-4. Card 2 Run — TTFT includes connect.  
-5. Card 3 — new instance = pay connect again; optional real scale-to-zero.  
-6. Card 4 — 10s timeout if the NAT IP is not what Neon allows.
+2. Card 1 · Run 10× — fastest TTFT, connect 0.  
+3. Card 2 · Run 10× — slightly above card 1 (query only).  
+4. Card 3 · Run 10× — above card 2 (new connect every time).  
+5. Card 4 · Run 10× — tokens, then cut; TTFT vs stopped ms.
 
-**Close:** *Don’t await a new connection before the first token. If you must check Postgres, reuse a socket on a warm instance. Keep min-instances > 0 if first-hit NAT+cold-start is unacceptable. List the NAT IP and force all egress through it.*
+**Close:** *Fast first token: don’t wait on a new DB connection. New containers pay connect again. If the IP is blocked, start-then-fail cuts the chat; the timeout is “stopped,” not a slow query.*
 
 ---
 
@@ -285,4 +266,4 @@ Do not click Warm/ping on other cards before you need them. Card 1 first.
 | `database: null` | `DATABASE_URL` missing on the revision. |
 | Gateway error on Run | `AI_GATEWAY_API_KEY` or `MODEL`. |
 | Connector create fails | `/28` in use; pick another range. |
-| Card 1 TTFT jumps 900–1600 ms | Model noise. Use ping for the allow-list story. |
+| Card 1 TTFT still moves a bit after 10× | Normal model noise; the average is the number to quote. |

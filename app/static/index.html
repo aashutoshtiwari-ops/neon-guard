@@ -13,15 +13,14 @@
     .lede { color: var(--muted); margin: 0 0 16px; font-size: 0.95rem; }
     .pills { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
     .pill { background: var(--card); border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; font-size: 0.85rem; }
-    .layout { display: grid; grid-template-columns: 200px 1fr; gap: 16px; }
+    .layout { display: grid; grid-template-columns: 220px 1fr; gap: 16px; }
     @media (max-width: 760px) { .layout { grid-template-columns: 1fr; } }
     .nav { display: flex; flex-direction: column; gap: 6px; }
     .nav button, .ghost { background: var(--card); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font: inherit; cursor: pointer; text-align: left; }
     .nav button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
     .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
     .card h2 { margin: 0 0 8px; font-size: 1.05rem; }
-    .card ol { margin: 8px 0 12px; padding-left: 1.2rem; }
-    .look { background: #efe8da; border-radius: 8px; padding: 10px 12px; font-size: 0.9rem; margin-bottom: 12px; }
+    .card p { margin: 0 0 12px; line-height: 1.45; }
     .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
     .go { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 10px 16px; font: inherit; cursor: pointer; }
     .go:disabled { opacity: 0.5; }
@@ -39,7 +38,7 @@
 <body>
   <main>
     <h1>Cloud Run + Neon IP allow list</h1>
-    <p class="lede">Only TTFT costs that appear when Cloud Run must reach Neon through an IP allow list (static NAT). Model time still jitters — use connect_ms vs query_ms. Card 4 has no Run.</p>
+    <p class="lede">Each Run is the average of 10 requests so one noisy model call does not set the story.</p>
     <div class="pills" id="status"></div>
     <div class="layout">
       <nav class="nav" id="nav"></nav>
@@ -50,7 +49,9 @@
     <div id="logs"></div>
   </main>
   <script>
+    const RUNS = 10;
     const promptDefault = "What is time to first token, in one sentence?";
+    const promptAbort = "Count from 1 to 80, one number per line.";
 
     function parseSse(block) {
       let event = "message", data = "";
@@ -61,17 +62,25 @@
       return { event, data };
     }
 
-    function metrics(meta, text) {
+    function avg(nums) {
+      const xs = nums.filter((n) => n != null && !Number.isNaN(n));
+      if (!xs.length) return null;
+      return Math.round(xs.reduce((a, b) => a + b, 0) / xs.length);
+    }
+
+    function metrics(meta, text, n, abort) {
       const cell = (k, v) => `<div class="metric"><b>${v ?? "—"}</b><span>${k}</span></div>`;
-      return `<div class="metrics">
+      return `<p class="lede">Average of ${n} requests</p>
+        <div class="metrics">
         ${cell("TTFT ms", meta.ttft_ms)}
         ${cell("client TTFT ms", meta.client_ttft_ms)}
+        ${abort ? cell("stopped ms", meta.stopped_ms) : ""}
         ${cell("connect ms", meta.connect_ms)}
         ${cell("query ms", meta.query_ms)}
       </div><div class="chat">${text || ""}</div>`;
     }
 
-    async function consume(res, t0, onMeta) {
+    async function consume(res, t0) {
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.error || res.statusText);
@@ -89,15 +98,18 @@
           const { event, data } = parseSse(part);
           if (!data) continue;
           if (event === "meta") {
-            meta = JSON.parse(data);
-            if (t0 != null) meta.client_ttft_ms = Math.round(performance.now() - t0);
-            if (onMeta) onMeta(meta);
+            meta = { ...meta, ...JSON.parse(data) };
+            meta.client_ttft_ms = Math.round(performance.now() - t0);
             continue;
           }
           if (data === "[DONE]") continue;
           try {
             const json = JSON.parse(data);
-            if (json.error) { text += "\n" + json.error; continue; }
+            if (json.error) {
+              text += (text ? "\n" : "") + json.error;
+              if (json.stopped_ms != null) meta.stopped_ms = json.stopped_ms;
+              continue;
+            }
             const delta = json.choices?.[0]?.delta?.content;
             if (delta) text += delta;
           } catch (_) {}
@@ -106,8 +118,8 @@
       return { meta, text };
     }
 
-    function openChat(scenario, role, prompt) {
-      return fetch(`/chat/completions?scenario=${encodeURIComponent(scenario)}&role=${encodeURIComponent(role)}`, {
+    function openChat(scenario, prompt) {
+      return fetch(`/chat/completions?scenario=${encodeURIComponent(scenario)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ messages: [{ role: "user", content: prompt }] }),
@@ -116,32 +128,16 @@
 
     function render(s) {
       document.querySelectorAll(".nav button").forEach((b) => b.classList.toggle("on", b.dataset.id === s.id));
-      const runnable = s.kind !== "explain";
+      const prompt = s.kind === "abort" ? promptAbort : promptDefault;
       document.getElementById("panel").innerHTML = `
         <h2>${s.title}</h2>
         <p>${s.summary}</p>
-        <ol>${s.steps.map((x) => `<li>${x}</li>`).join("")}</ol>
-        <div class="look"><strong>Look for:</strong> ${s.look_for}</div>
-        ${runnable ? `<textarea id="prompt">${promptDefault}</textarea>
-          <div class="actions">
-            <button class="go" id="run">Run</button>
-            <button class="ghost" id="ping" type="button">DB ping (no model)</button>
-          </div>` : ""}
-        <div id="pingOut" class="lede"></div>
+        <textarea id="prompt">${prompt}</textarea>
+        <div class="actions">
+          <button class="go" id="run">Run 10×</button>
+        </div>
         <div id="out"></div>`;
-      if (!runnable) return;
       document.getElementById("run").onclick = () => run(s);
-      document.getElementById("ping").onclick = pingDb;
-    }
-
-    async function pingDb() {
-      const data = await fetch("/demos/ping", { method: "POST" }).then((r) => r.json());
-      const el = document.getElementById("pingOut");
-      if (!data.ok) {
-        el.textContent = data.error || "ping failed (wrong egress IP / allow list / timeout)";
-        return;
-      }
-      el.textContent = `New connection: connect ${data.connect_ms} ms · query ${data.query_ms} ms`;
     }
 
     async function run(s) {
@@ -149,11 +145,31 @@
       const out = document.getElementById("out");
       const prompt = document.getElementById("prompt").value;
       btn.disabled = true;
-      out.textContent = "Running…";
+      const ttft = [], client = [], stopped = [], connect = [], query = [];
+      let lastText = "";
       try {
-        const t0 = performance.now();
-        const { meta, text } = await consume(await openChat(s.id, "solo", prompt), t0);
-        out.innerHTML = metrics(meta, text);
+        for (let i = 1; i <= RUNS; i++) {
+          if (s.id === "nat" && i === 1) {
+            out.textContent = "Warming saved connection…";
+            await fetch("/demos/warmup", { method: "POST" });
+          }
+          out.textContent = `Running ${i} / ${RUNS}…`;
+          const t0 = performance.now();
+          const { meta, text } = await consume(await openChat(s.id, prompt), t0);
+          lastText = text;
+          ttft.push(meta.ttft_ms);
+          client.push(meta.client_ttft_ms);
+          stopped.push(meta.stopped_ms);
+          connect.push(meta.connect_ms);
+          query.push(meta.query_ms);
+        }
+        out.innerHTML = metrics({
+          ttft_ms: avg(ttft),
+          client_ttft_ms: avg(client),
+          stopped_ms: avg(stopped),
+          connect_ms: avg(connect),
+          query_ms: avg(query),
+        }, lastText, RUNS, s.kind === "abort");
         await loadLogs();
       } catch (e) {
         out.innerHTML = `<p class="err">${e.message || e}</p>`;
@@ -193,7 +209,7 @@
       const nav = document.getElementById("nav");
       nav.innerHTML = scenarios.map((s) => `<button type="button" data-id="${s.id}">${s.title}</button>`).join("");
       nav.querySelectorAll("button").forEach((b) => {
-        b.onclick = () => render(scenarios.find((s) => s.id === b.dataset.id));
+        b.onclick = () => render(scenarios.find((x) => x.id === b.dataset.id));
       });
       render(scenarios[0]);
     })();

@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from app.catalog import SCENARIOS
 from app.config import API_KEY, DATABASE_URL, MODEL, STATIC_DIR
 from app.gateway import stream_completion
-from app.neon import list_logs, ping, platform
+from app.neon import list_logs, ping, platform, warmup
 
 logging.basicConfig(level=logging.INFO)
 
@@ -38,9 +38,9 @@ def demos():
     return {"scenarios": SCENARIOS}
 
 
-@app.post("/demos/ping")
-def demos_ping():
-    return ping()
+@app.post("/demos/warmup")
+def demos_warmup():
+    return warmup()
 
 
 @app.get("/requests")
